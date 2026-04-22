@@ -1,0 +1,31 @@
+# Virtual environment
+venv/
+env/
+
+# Build outputs
+build/
+dist/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Downloaded data
+data/
+
+# PyInstaller
+*.spec
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db

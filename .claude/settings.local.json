@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:dadosabertos.rfb.gov.br)",
+      "WebSearch",
+      "WebFetch(domain:www.gov.br)"
+    ]
+  }
+}
