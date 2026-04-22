@@ -431,7 +431,16 @@ def _notify_webhook(message: str) -> None:
         logger.warning("Webhook failed: %s", exc)
 
 
-def run(datasets: list[str] | None = None, download_dir: Path = DOWNLOAD_DIR) -> None:
+def run(
+    selection: dict[str, list[str] | None] | None = None,
+    download_dir: Path = DOWNLOAD_DIR,
+) -> None:
+    """Run the crawler.
+
+    selection: dict mapping dataset -> list of subfolder names to download
+               (None = download entire dataset). If selection itself is None,
+               all DATASETS are downloaded entirely.
+    """
     run_id = uuid.uuid4().hex[:8]
     t0 = time.monotonic()
     logger.info("=== RFB Crawler started | run_id=%s ===", run_id)
@@ -440,16 +449,30 @@ def run(datasets: list[str] | None = None, download_dir: Path = DOWNLOAD_DIR) ->
     all_rows: list[dict] = []
     all_stats: list[dict] = []
 
+    if selection is None:
+        selection = {ds: None for ds in DATASETS}
+
     with NetworkSession() as session:
         scraper = DirectoryScraper(session)
 
-        for dataset in (datasets or DATASETS):
-            logger.info("--- Dataset: %s ---", dataset)
+        for dataset, subfolders in selection.items():
+            label = dataset if not subfolders else f"{dataset} ({', '.join(subfolders)})"
+            logger.info("--- Dataset: %s ---", label)
             stats = {"dataset": dataset, "new": 0, "skipped": 0, "errors": 0, "bytes": 0}
-            url = f"{BASE_URL}/{dataset}/"
 
+            entries: list[DirectoryEntry] = []
             try:
-                entries = list(scraper.crawl(url, dataset))
+                if subfolders:
+                    # Crawl only the selected subfolders
+                    for sub in subfolders:
+                        sub_url = f"{BASE_URL}/{dataset}/{sub}/"
+                        entries.extend(
+                            scraper.crawl(sub_url, dataset, [dataset, sub])
+                        )
+                else:
+                    entries.extend(
+                        scraper.crawl(f"{BASE_URL}/{dataset}/", dataset)
+                    )
             except SchemaChangeError as exc:
                 logger.error("Schema change in %s: %s", dataset, exc)
                 stats["errors"] += 1
@@ -662,12 +685,216 @@ def _ensure_connectivity() -> None:
     sys.exit(2)
 
 
+def _pick_from_list(
+    title: str,
+    prompt: str,
+    items: list[tuple[str, str]],
+    preselect_all: bool = False,
+) -> list[str]:
+    """Show a multi-select listbox dialog and return the chosen item *values*.
+
+    items is a list of (value, display_label) tuples.
+    Returns [] if the user cancels.
+    """
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+
+    if not items:
+        return []
+
+    win = tk.Tk()
+    win.title(title)
+    win.geometry("560x460")
+    win.attributes("-topmost", True)
+    win.lift()
+
+    result: dict = {"values": None}
+
+    ttk.Label(win, text=prompt, wraplength=540, justify="left").pack(
+        padx=12, pady=(12, 6), anchor="w"
+    )
+    ttk.Label(
+        win,
+        text="(Use Ctrl+clique para escolher vários, Shift+clique para intervalo.)",
+        foreground="#666",
+    ).pack(padx=12, anchor="w")
+
+    frame = ttk.Frame(win)
+    frame.pack(fill="both", expand=True, padx=12, pady=8)
+
+    scrollbar = ttk.Scrollbar(frame, orient="vertical")
+    listbox = tk.Listbox(
+        frame,
+        selectmode="extended",
+        yscrollcommand=scrollbar.set,
+        activestyle="dotbox",
+        font=("Consolas", 10),
+    )
+    scrollbar.config(command=listbox.yview)
+    scrollbar.pack(side="right", fill="y")
+    listbox.pack(side="left", fill="both", expand=True)
+
+    for _, label in items:
+        listbox.insert("end", label)
+
+    if preselect_all:
+        listbox.select_set(0, "end")
+
+    def _select_all() -> None:
+        listbox.select_set(0, "end")
+
+    def _clear() -> None:
+        listbox.selection_clear(0, "end")
+
+    def _confirm() -> None:
+        idxs = listbox.curselection()
+        if not idxs:
+            messagebox.showwarning(
+                "Nenhuma seleção",
+                "Selecione pelo menos um item ou clique em Cancelar.",
+                parent=win,
+            )
+            return
+        result["values"] = [items[i][0] for i in idxs]
+        win.destroy()
+
+    def _cancel() -> None:
+        result["values"] = None
+        win.destroy()
+
+    btn_bar = ttk.Frame(win)
+    btn_bar.pack(fill="x", padx=12, pady=(0, 12))
+    ttk.Button(btn_bar, text="Selecionar tudo", command=_select_all).pack(side="left")
+    ttk.Button(btn_bar, text="Limpar", command=_clear).pack(side="left", padx=6)
+    ttk.Button(btn_bar, text="Cancelar", command=_cancel).pack(side="right")
+    ttk.Button(btn_bar, text="Confirmar", command=_confirm).pack(side="right", padx=6)
+
+    win.protocol("WM_DELETE_WINDOW", _cancel)
+    win.mainloop()
+    return result["values"] or []
+
+
+def _format_listing_label(item: dict) -> str:
+    """Build a friendly label for a directory listing entry."""
+    name = item["name"]
+    parts = [name]
+    if item.get("modified"):
+        parts.append(f"  [{item['modified']}]")
+    if item.get("size_bytes"):
+        size_mb = item["size_bytes"] / 1e6
+        if size_mb >= 1024:
+            parts.append(f"  ({size_mb / 1024:.1f} GB)")
+        else:
+            parts.append(f"  ({size_mb:.1f} MB)")
+    return "".join(parts)
+
+
+def _interactive_selection(scraper: DirectoryScraper) -> dict[str, list[str] | None]:
+    """Show interactive dialogs for the user to pick datasets and subfolders.
+
+    Returns a selection dict: { dataset: [subfolder1, ...] | None }
+    where None means "download the whole dataset".
+    Exits the program if the user cancels.
+    """
+    print("Listando datasets disponíveis no portal ...")
+    try:
+        top_entries = scraper.list_directory(BASE_URL + "/")
+    except RFBConnectionError as exc:
+        _show_error(
+            "RFB Crawler — Erro",
+            f"Não foi possível listar os datasets do portal:\n\n{exc}",
+        )
+        sys.exit(2)
+
+    available_datasets = [e for e in top_entries if e["is_dir"]]
+    if not available_datasets:
+        _show_error(
+            "RFB Crawler — Erro",
+            "Nenhum dataset encontrado no portal. A estrutura pode ter mudado.",
+        )
+        sys.exit(2)
+
+    items = [
+        (e["name"], _format_listing_label(e)) for e in available_datasets
+    ]
+    chosen = _pick_from_list(
+        title="RFB Crawler — Selecione os datasets",
+        prompt=(
+            "Selecione os DATASETS que deseja baixar.\n"
+            "Em seguida, você poderá refinar quais subpastas (competências) "
+            "de cada dataset baixar."
+        ),
+        items=items,
+    )
+    if not chosen:
+        print("Nenhum dataset selecionado. Encerrando.")
+        sys.exit(0)
+
+    selection: dict[str, list[str] | None] = {}
+    for dataset in chosen:
+        print(f"Listando subpastas de {dataset} ...")
+        try:
+            sub_entries = scraper.list_directory(f"{BASE_URL}/{dataset}/")
+        except RFBConnectionError as exc:
+            logger.warning("Não foi possível listar %s: %s — baixando completo.",
+                           dataset, exc)
+            selection[dataset] = None
+            continue
+
+        sub_dirs = [e for e in sub_entries if e["is_dir"]]
+        if not sub_dirs:
+            # Dataset has only files, no subfolders — download all
+            selection[dataset] = None
+            continue
+
+        sub_items = [(e["name"], _format_listing_label(e)) for e in sub_dirs]
+        sub_chosen = _pick_from_list(
+            title=f"RFB Crawler — Subpastas de {dataset}",
+            prompt=(
+                f"Selecione as subpastas de {dataset} que deseja baixar.\n"
+                "Cancele esta janela para baixar TODAS as subpastas deste dataset."
+            ),
+            items=sub_items,
+        )
+        selection[dataset] = sub_chosen if sub_chosen else None
+
+    # Confirmation summary
+    from tkinter import messagebox
+    summary_lines = ["Resumo da seleção:\n"]
+    for ds, subs in selection.items():
+        if subs:
+            summary_lines.append(f"  • {ds}: {', '.join(subs)}")
+        else:
+            summary_lines.append(f"  • {ds}: (TODAS as subpastas)")
+    summary_lines.append("\nDeseja continuar e iniciar o download?")
+
+    root = _gui_root()
+    proceed = messagebox.askyesno(
+        "RFB Crawler — Confirmar download",
+        "\n".join(summary_lines),
+        parent=root,
+    )
+    root.destroy()
+    if not proceed:
+        print("Operação cancelada pelo usuário.")
+        sys.exit(0)
+
+    return selection
+
+
 if __name__ == "__main__":
     save_dir = _ask_save_directory()
     print(f"Pasta de destino: {save_dir}")
     _ensure_connectivity()
+
     try:
-        run(download_dir=save_dir)
+        with NetworkSession() as _sel_session:
+            _sel_scraper = DirectoryScraper(_sel_session)
+            user_selection = _interactive_selection(_sel_scraper)
+
+        run(selection=user_selection, download_dir=save_dir)
+    except SystemExit:
+        raise
     except Exception as exc:
         logger.exception("Falha inesperada na execução")
         _show_error("RFB Crawler — Erro", f"Erro durante a execução:\n\n{exc}")
