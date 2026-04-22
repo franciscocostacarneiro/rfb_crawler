@@ -26,6 +26,8 @@ from urllib.parse import urljoin
 # ---------------------------------------------------------------------------
 # Third-party
 # ---------------------------------------------------------------------------
+import xml.etree.ElementTree as ET
+
 import requests
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
@@ -35,8 +37,19 @@ from urllib3.util.retry import Retry
 # CONFIG
 # ===========================================================================
 
-BASE_URL = "https://dadosabertos.rfb.gov.br"
-DATASETS = ["CNPJ", "CAFIR", "CNO", "SISEN"]
+# --- Portal 1: Apache Directory Listing ---
+APACHE_BASE_URL = "https://dadosabertos.rfb.gov.br"
+APACHE_DATASETS = ["CNPJ", "CAFIR", "CNO", "SISEN"]
+
+# --- Portal 2: Nextcloud Public Share ---
+NC_BASE_URL = "https://arquivos.receitafederal.gov.br"
+NC_SHARE_TOKEN = "gn672Ad4CF8N6TK"
+NC_SHARE_ROOT = "/Dados/Cadastros"   # path inside the share
+
+# Active portal constants (overridden at runtime by user selection)
+BASE_URL = APACHE_BASE_URL
+DATASETS = APACHE_DATASETS
+
 DOWNLOAD_DIR = Path("data")
 MAX_WORKERS = 3
 CHUNK_SIZE = 8 * 1024 * 1024   # 8 MB
@@ -132,6 +145,33 @@ class NetworkSession:
 
         tmp.replace(dest)
         return bytes_written, sha256.hexdigest()
+
+    def propfind(
+        self,
+        url: str,
+        body: str,
+        auth: tuple[str, str] | None = None,
+    ) -> requests.Response:
+        """Send a WebDAV PROPFIND request and return the response."""
+        kwargs: dict = {
+            "headers": {"Depth": "1", "Content-Type": "application/xml"},
+            "data": body.encode("utf-8"),
+            "timeout": TIMEOUT,
+        }
+        if auth:
+            kwargs["auth"] = auth
+        try:
+            resp = self._session.request("PROPFIND", url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout as exc:
+            raise RFBConnectionError(f"Timeout PROPFIND: {url}") from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise RFBConnectionError(f"Connection failed PROPFIND: {url}") from exc
+        except requests.exceptions.HTTPError as exc:
+            raise RFBConnectionError(
+                f"HTTP {exc.response.status_code} PROPFIND: {url}"
+            ) from exc
 
     def close(self) -> None:
         self._session.close()
@@ -351,6 +391,186 @@ class DataGovernance:
         return self.root.joinpath(*entry.hierarchy, entry.name)
 
 # ===========================================================================
+# NEXTCLOUD SCRAPER (WebDAV-based)
+# ===========================================================================
+
+_PROPFIND_BODY = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<d:propfind xmlns:d="DAV:">'
+    '<d:prop>'
+    '<d:displayname/>'
+    '<d:resourcetype/>'
+    '<d:getcontentlength/>'
+    '<d:getlastmodified/>'
+    '</d:prop>'
+    '</d:propfind>'
+)
+
+_NS = {"d": "DAV:"}
+
+
+class NextcloudScraper:
+    """Scraper for Nextcloud public-share portals via WebDAV PROPFIND.
+
+    Authentication uses the share token as username with an empty password,
+    which is the standard Nextcloud mechanism for public shares.
+    Download URLs use the Nextcloud share-download endpoint.
+    """
+
+    def __init__(
+        self,
+        session: NetworkSession,
+        base_url: str = NC_BASE_URL,
+        share_token: str = NC_SHARE_TOKEN,
+    ) -> None:
+        self._session = session
+        self._base = base_url.rstrip("/")
+        self._token = share_token
+        self._webdav_root = f"{self._base}/remote.php/dav/public-files/{self._token}"
+        self._auth = (share_token, "")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _propfind(self, nc_path: str) -> list[dict]:
+        """PROPFIND on *nc_path* (e.g. '/Dados/Cadastros'). Returns raw entries."""
+        url = self._webdav_root + nc_path.rstrip("/") + "/"
+        try:
+            resp = self._session.propfind(url, _PROPFIND_BODY, auth=self._auth)
+        except RFBConnectionError:
+            raise
+        return self._parse_propfind_xml(resp.text, nc_path)
+
+    def _parse_propfind_xml(self, xml_text: str, base_path: str) -> list[dict]:
+        """Parse WebDAV PROPFIND response. Returns list of child entries."""
+        try:
+            root_el = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            raise SchemaChangeError(f"Cannot parse WebDAV XML: {exc}") from exc
+
+        prefix = f"/remote.php/dav/public-files/{self._token}"
+        entries = []
+
+        for response in root_el.findall("d:response", _NS):
+            href_el = response.find("d:href", _NS)
+            if href_el is None or not href_el.text:
+                continue
+            href = href_el.text
+
+            # Extract the path relative to the share root
+            if href.startswith(prefix):
+                item_path = href[len(prefix):]
+            else:
+                item_path = href
+
+            item_path = item_path.rstrip("/")
+
+            # Skip the parent directory itself
+            if item_path == base_path.rstrip("/"):
+                continue
+
+            propstat = response.find("d:propstat", _NS)
+            if propstat is None:
+                continue
+            prop = propstat.find("d:prop", _NS)
+            if prop is None:
+                continue
+
+            resourcetype = prop.find("d:resourcetype", _NS)
+            is_dir = (
+                resourcetype is not None
+                and resourcetype.find("d:collection", _NS) is not None
+            )
+
+            name_el = prop.find("d:displayname", _NS)
+            name = (name_el.text or "").strip() if name_el is not None else ""
+            if not name:
+                name = item_path.rstrip("/").split("/")[-1]
+            if not name:
+                continue
+
+            size_el = prop.find("d:getcontentlength", _NS)
+            size_bytes: int | None = None
+            if size_el is not None and size_el.text:
+                try:
+                    size_bytes = int(size_el.text)
+                except ValueError:
+                    pass
+
+            modified_el = prop.find("d:getlastmodified", _NS)
+            modified = modified_el.text if modified_el is not None else None
+
+            entries.append(
+                {
+                    "name": name,
+                    "path": item_path,
+                    "is_dir": is_dir,
+                    "size_bytes": size_bytes,
+                    "modified": modified,
+                }
+            )
+
+        return entries
+
+    def _download_url(self, nc_path: str) -> str:
+        """Build the Nextcloud share-download URL for a file path."""
+        from urllib.parse import quote
+        return f"{self._base}/index.php/s/{self._token}/download?path={quote(nc_path)}"
+
+    # ------------------------------------------------------------------
+    # Public interface (mirrors DirectoryScraper)
+    # ------------------------------------------------------------------
+
+    def list_directory(self, nc_path: str) -> list[dict]:
+        """List *nc_path* and return entries in the same format as DirectoryScraper."""
+        entries = self._propfind(nc_path)
+        return [
+            {
+                "name": e["name"],
+                "url": self._download_url(e["path"]) if not e["is_dir"] else None,
+                "is_dir": e["is_dir"],
+                "modified": e["modified"],
+                "size_bytes": e["size_bytes"],
+                "path": e["path"],
+            }
+            for e in entries
+        ]
+
+    def crawl(
+        self,
+        nc_path: str,
+        dataset: str,
+        hierarchy: list[str] | None = None,
+    ):
+        """DFS crawl starting at *nc_path*. Yields DirectoryEntry for each file."""
+        if hierarchy is None:
+            hierarchy = [dataset]
+
+        logger.info("Scanning (Nextcloud WebDAV) %s", nc_path)
+        try:
+            entries = self._propfind(nc_path)
+        except RFBConnectionError as exc:
+            logger.error("Cannot list %s: %s", nc_path, exc)
+            return
+
+        for e in entries:
+            if e["is_dir"]:
+                yield from self.crawl(
+                    e["path"], dataset, hierarchy + [e["name"]]
+                )
+            else:
+                yield DirectoryEntry(
+                    name=e["name"],
+                    url=self._download_url(e["path"]),
+                    is_dir=False,
+                    parent_folder=hierarchy[-1] if len(hierarchy) > 1 else dataset,
+                    size_bytes=e["size_bytes"],
+                    modified=e["modified"],
+                    hierarchy=list(hierarchy),
+                )
+
+# ===========================================================================
 # ORCHESTRATOR
 # ===========================================================================
 
@@ -434,26 +654,33 @@ def _notify_webhook(message: str) -> None:
 def run(
     selection: dict[str, list[str] | None] | None = None,
     download_dir: Path = DOWNLOAD_DIR,
+    portal: str = "apache",
 ) -> None:
     """Run the crawler.
 
     selection: dict mapping dataset -> list of subfolder names to download
                (None = download entire dataset). If selection itself is None,
                all DATASETS are downloaded entirely.
+    portal: "apache" or "nextcloud".
     """
     run_id = uuid.uuid4().hex[:8]
     t0 = time.monotonic()
-    logger.info("=== RFB Crawler started | run_id=%s ===", run_id)
+    logger.info("=== RFB Crawler started | run_id=%s portal=%s ===", run_id, portal)
 
     governance = DataGovernance(root=download_dir)
     all_rows: list[dict] = []
     all_stats: list[dict] = []
 
     if selection is None:
-        selection = {ds: None for ds in DATASETS}
+        if portal == "apache":
+            selection = {ds: None for ds in APACHE_DATASETS}
+        else:
+            selection = {"Cadastros": None}
 
     with NetworkSession() as session:
-        scraper = DirectoryScraper(session)
+        scraper: DirectoryScraper | NextcloudScraper = (
+            DirectoryScraper(session) if portal == "apache" else NextcloudScraper(session)
+        )
 
         for dataset, subfolders in selection.items():
             label = dataset if not subfolders else f"{dataset} ({', '.join(subfolders)})"
@@ -462,17 +689,28 @@ def run(
 
             entries: list[DirectoryEntry] = []
             try:
-                if subfolders:
-                    # Crawl only the selected subfolders
-                    for sub in subfolders:
-                        sub_url = f"{BASE_URL}/{dataset}/{sub}/"
+                if portal == "apache":
+                    if subfolders:
+                        for sub in subfolders:
+                            sub_url = f"{APACHE_BASE_URL}/{dataset}/{sub}/"
+                            entries.extend(
+                                scraper.crawl(sub_url, dataset, [dataset, sub])
+                            )
+                    else:
                         entries.extend(
-                            scraper.crawl(sub_url, dataset, [dataset, sub])
+                            scraper.crawl(f"{APACHE_BASE_URL}/{dataset}/", dataset)
                         )
-                else:
-                    entries.extend(
-                        scraper.crawl(f"{BASE_URL}/{dataset}/", dataset)
-                    )
+                else:  # nextcloud
+                    if subfolders:
+                        for sub in subfolders:
+                            nc_path = f"{NC_SHARE_ROOT}/{dataset}/{sub}"
+                            entries.extend(
+                                scraper.crawl(nc_path, dataset, [dataset, sub])
+                            )
+                    else:
+                        entries.extend(
+                            scraper.crawl(f"{NC_SHARE_ROOT}/{dataset}", dataset)
+                        )
             except SchemaChangeError as exc:
                 logger.error("Schema change in %s: %s", dataset, exc)
                 stats["errors"] += 1
@@ -581,20 +819,17 @@ def _ask_save_directory() -> Path:
     return chosen
 
 
-def _check_connectivity(timeout: int = 8) -> tuple[bool, str]:
-    """Quick reachability check to the RFB portal.
-
-    Returns (ok, message). Uses os.environ proxy settings (HTTP_PROXY,
-    HTTPS_PROXY) automatically via requests.
-    """
+def _check_connectivity(url: str, timeout: int = 8) -> tuple[bool, str]:
+    """Quick reachability check. Returns (ok, message)."""
     try:
         resp = requests.head(
-            BASE_URL + "/",
+            url,
             timeout=(timeout, timeout),
             allow_redirects=True,
             headers={"User-Agent": "Mozilla/5.0 (compatible; RFBCrawler/1.0)"},
         )
-        if resp.status_code < 500:
+        # 401 on Nextcloud = server reachable, requires auth (expected for WebDAV)
+        if resp.status_code < 500 or resp.status_code == 401:
             return True, f"HTTP {resp.status_code}"
         return False, f"HTTP {resp.status_code}"
     except requests.exceptions.Timeout:
@@ -605,7 +840,7 @@ def _check_connectivity(timeout: int = 8) -> tuple[bool, str]:
         return False, f"Erro: {exc}"
 
 
-def _ask_proxy() -> str | None:
+def _ask_proxy(portal_url: str) -> str | None:
     """Ask the user for an optional proxy URL. Returns None if skipped."""
     import os
     from tkinter import simpledialog, messagebox
@@ -614,7 +849,7 @@ def _ask_proxy() -> str | None:
     answer = messagebox.askyesno(
         "RFB Crawler — Sem conectividade",
         "Não foi possível conectar ao servidor da Receita Federal\n"
-        f"({BASE_URL}).\n\n"
+        f"({portal_url}).\n\n"
         "Causas comuns:\n"
         "  • Firewall corporativo ou antivírus bloqueando o destino\n"
         "  • Rede exige um servidor proxy\n"
@@ -652,19 +887,73 @@ def _show_error(title: str, message: str) -> None:
         print(f"[{title}] {message}")
 
 
-def _ensure_connectivity() -> None:
-    """Pre-flight check. Aborts (with GUI message) if RFB is unreachable."""
-    print(f"Verificando conectividade com {BASE_URL} ...")
-    ok, info = _check_connectivity()
+
+def _ask_portal() -> str:
+    """Ask user which portal to use. Returns 'apache' or 'nextcloud'."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    win = tk.Tk()
+    win.title("RFB Crawler — Selecione o Portal")
+    win.geometry("520x260")
+    win.resizable(False, False)
+    win.attributes("-topmost", True)
+    result: dict[str, str | None] = {"portal": None}
+
+    ttk.Label(
+        win,
+        text="Selecione o portal de dados da Receita Federal:",
+        font=("Segoe UI", 11, "bold"),
+        wraplength=480,
+    ).pack(padx=20, pady=(24, 10))
+
+    btn_frame = ttk.Frame(win)
+    btn_frame.pack(padx=20, pady=6, fill="x")
+
+    def pick(portal: str) -> None:
+        result["portal"] = portal
+        win.destroy()
+
+    ttk.Button(
+        btn_frame,
+        text="dadosabertos.rfb.gov.br  (Apache — CNPJ, CAFIR, CNO, SISEN)",
+        command=lambda: pick("apache"),
+    ).pack(pady=5, fill="x")
+
+    ttk.Button(
+        btn_frame,
+        text="arquivos.receitafederal.gov.br  (Nextcloud — /Dados/Cadastros)",
+        command=lambda: pick("nextcloud"),
+    ).pack(pady=5, fill="x")
+
+    win.protocol("WM_DELETE_WINDOW", lambda: sys.exit(0))
+    win.mainloop()
+
+    if result["portal"] is None:
+        sys.exit(0)
+    return result["portal"]
+
+
+def _ensure_connectivity(portal: str) -> None:
+    """Pre-flight check for the chosen portal. Aborts with GUI message if unreachable."""
+    if portal == "apache":
+        check_url = APACHE_BASE_URL + "/"
+        domain = "dadosabertos.rfb.gov.br"
+    else:
+        check_url = NC_BASE_URL + "/"
+        domain = "arquivos.receitafederal.gov.br"
+
+    print(f"Verificando conectividade com {check_url} ...")
+    ok, info = _check_connectivity(check_url)
     if ok:
         print(f"  Conectividade OK ({info}).")
         return
 
     print(f"  FALHA: {info}")
-    proxy = _ask_proxy()
+    proxy = _ask_proxy(check_url)
     if proxy:
         print(f"Tentando novamente via proxy: {proxy}")
-        ok, info = _check_connectivity(timeout=15)
+        ok, info = _check_connectivity(check_url, timeout=15)
         if ok:
             print(f"  Conectividade via proxy OK ({info}).")
             return
@@ -673,11 +962,10 @@ def _ensure_connectivity() -> None:
     _show_error(
         "RFB Crawler — Sem conexão",
         "Não foi possível conectar ao servidor da Receita Federal:\n"
-        f"  {BASE_URL}\n\n"
+        f"  {check_url}\n\n"
         f"Detalhe técnico: {info}\n\n"
         "Verifique com a equipe de TI:\n"
-        "  • Liberação de acesso ao IP/domínio dadosabertos.rfb.gov.br "
-        "(porta 443/HTTPS)\n"
+        f"  • Liberação de acesso ao domínio {domain} (porta 443/HTTPS)\n"
         "  • Configuração de proxy corporativo (se houver)\n"
         "  • Regras de firewall/antivírus\n\n"
         "O programa será encerrado.",
@@ -789,16 +1077,27 @@ def _format_listing_label(item: dict) -> str:
     return "".join(parts)
 
 
-def _interactive_selection(scraper: DirectoryScraper) -> dict[str, list[str] | None]:
+def _interactive_selection(session: NetworkSession, portal: str) -> dict[str, list[str] | None]:
     """Show interactive dialogs for the user to pick datasets and subfolders.
 
     Returns a selection dict: { dataset: [subfolder1, ...] | None }
     where None means "download the whole dataset".
     Exits the program if the user cancels.
     """
+    if portal == "apache":
+        scraper: DirectoryScraper | NextcloudScraper = DirectoryScraper(session)
+        root_listing_url = APACHE_BASE_URL + "/"
+        def sub_listing_url(ds: str) -> str:
+            return f"{APACHE_BASE_URL}/{ds}/"
+    else:
+        scraper = NextcloudScraper(session)
+        root_listing_url = NC_SHARE_ROOT
+        def sub_listing_url(ds: str) -> str:
+            return f"{NC_SHARE_ROOT}/{ds}"
+
     print("Listando datasets disponíveis no portal ...")
     try:
-        top_entries = scraper.list_directory(BASE_URL + "/")
+        top_entries = scraper.list_directory(root_listing_url)
     except RFBConnectionError as exc:
         _show_error(
             "RFB Crawler — Erro",
@@ -834,7 +1133,7 @@ def _interactive_selection(scraper: DirectoryScraper) -> dict[str, list[str] | N
     for dataset in chosen:
         print(f"Listando subpastas de {dataset} ...")
         try:
-            sub_entries = scraper.list_directory(f"{BASE_URL}/{dataset}/")
+            sub_entries = scraper.list_directory(sub_listing_url(dataset))
         except RFBConnectionError as exc:
             logger.warning("Não foi possível listar %s: %s — baixando completo.",
                            dataset, exc)
@@ -885,14 +1184,15 @@ def _interactive_selection(scraper: DirectoryScraper) -> dict[str, list[str] | N
 if __name__ == "__main__":
     save_dir = _ask_save_directory()
     print(f"Pasta de destino: {save_dir}")
-    _ensure_connectivity()
+    portal = _ask_portal()
+    print(f"Portal selecionado: {portal}")
+    _ensure_connectivity(portal)
 
     try:
         with NetworkSession() as _sel_session:
-            _sel_scraper = DirectoryScraper(_sel_session)
-            user_selection = _interactive_selection(_sel_scraper)
+            user_selection = _interactive_selection(_sel_session, portal)
 
-        run(selection=user_selection, download_dir=save_dir)
+        run(selection=user_selection, download_dir=save_dir, portal=portal)
     except SystemExit:
         raise
     except Exception as exc:
