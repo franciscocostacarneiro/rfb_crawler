@@ -52,7 +52,12 @@ class NetworkSession:
                 f"HTTP {exc.response.status_code} for {url}"
             ) from exc
 
-    def stream_download(self, url: str, dest: Path) -> tuple[int, str]:
+    def stream_download(
+        self,
+        url: str,
+        dest: Path,
+        auth: tuple[str, str] | None = None,
+    ) -> tuple[int, str]:
         """Download *url* to *dest* in streaming chunks.
 
         Returns:
@@ -66,7 +71,10 @@ class NetworkSession:
         tmp = dest.with_suffix(dest.suffix + ".part")
 
         try:
-            response = self._session.get(url, stream=True, timeout=TIMEOUT)
+            kwargs: dict = {"stream": True, "timeout": TIMEOUT}
+            if auth:
+                kwargs["auth"] = auth
+            response = self._session.get(url, **kwargs)
             response.raise_for_status()
         except requests.exceptions.Timeout as exc:
             raise RFBConnectionError(f"Timeout starting download: {url}") from exc
@@ -97,6 +105,33 @@ class NetworkSession:
 
     def close(self) -> None:
         self._session.close()
+
+    def propfind(
+        self,
+        url: str,
+        body: str,
+        auth: tuple[str, str] | None = None,
+    ) -> requests.Response:
+        """Send a WebDAV PROPFIND request and return the response."""
+        kwargs: dict = {
+            "headers": {"Depth": "1", "Content-Type": "application/xml"},
+            "data": body.encode("utf-8"),
+            "timeout": TIMEOUT,
+        }
+        if auth:
+            kwargs["auth"] = auth
+        try:
+            resp = self._session.request("PROPFIND", url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.Timeout as exc:
+            raise RFBConnectionError(f"Timeout PROPFIND: {url}") from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise RFBConnectionError(f"Connection failed PROPFIND: {url}") from exc
+        except requests.exceptions.HTTPError as exc:
+            raise RFBConnectionError(
+                f"HTTP {exc.response.status_code} PROPFIND: {url}"
+            ) from exc
 
     def __enter__(self):
         return self

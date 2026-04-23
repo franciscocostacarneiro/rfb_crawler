@@ -1,9 +1,25 @@
 from pathlib import Path
 
-# Base URL of the RFB open data portal
-BASE_URL = "https://dadosabertos.rfb.gov.br"
+# ---------------------------------------------------------------------------
+# Portal 1: Apache directory listing (dadosabertos.rfb.gov.br)
+# ---------------------------------------------------------------------------
+APACHE_BASE_URL = "https://dadosabertos.rfb.gov.br"
 
-# Top-level datasets to crawl
+# ---------------------------------------------------------------------------
+# Portal 2: Nextcloud public share (arquivos.receitafederal.gov.br)
+# ---------------------------------------------------------------------------
+NC_BASE_URL = "https://arquivos.receitafederal.gov.br"
+NC_SHARE_TOKEN = "gn672Ad4CF8N6TK"
+NC_SHARE_ROOT = "/Dados/Cadastros"   # path inside the share
+
+# Active portal — "nextcloud" is the current working portal.
+# Switch to "apache" when dadosabertos.rfb.gov.br is available again.
+PORTAL = "nextcloud"
+
+# Backwards-compatible alias (used by scraper/main for the Apache portal)
+BASE_URL = APACHE_BASE_URL
+
+# Top-level datasets to crawl (same names in both portals)
 DATASETS = ["CNPJ", "CAFIR", "CNO", "SISEN"]
 
 # Local download root

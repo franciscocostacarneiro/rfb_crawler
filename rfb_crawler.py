@@ -108,13 +108,21 @@ class NetworkSession:
                 f"HTTP {exc.response.status_code}: {url}"
             ) from exc
 
-    def stream_download(self, url: str, dest: Path) -> tuple[int, str]:
+    def stream_download(
+        self,
+        url: str,
+        dest: Path,
+        auth: tuple[str, str] | None = None,
+    ) -> tuple[int, str]:
         """Download url → dest in streaming chunks. Returns (bytes, sha256)."""
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_suffix(dest.suffix + ".part")
 
         try:
-            resp = self._session.get(url, stream=True, timeout=TIMEOUT)
+            kwargs: dict = {"stream": True, "timeout": TIMEOUT}
+            if auth:
+                kwargs["auth"] = auth
+            resp = self._session.get(url, **kwargs)
             resp.raise_for_status()
         except requests.exceptions.Timeout as exc:
             raise RFBConnectionError(f"Timeout starting download: {url}") from exc
@@ -426,7 +434,7 @@ class NextcloudScraper:
         self._session = session
         self._base = base_url.rstrip("/")
         self._token = share_token
-        self._webdav_root = f"{self._base}/remote.php/dav/public-files/{self._token}"
+        self._webdav_root = f"{self._base}/public.php/webdav"
         self._auth = (share_token, "")
 
     # ------------------------------------------------------------------
@@ -449,7 +457,7 @@ class NextcloudScraper:
         except ET.ParseError as exc:
             raise SchemaChangeError(f"Cannot parse WebDAV XML: {exc}") from exc
 
-        prefix = f"/remote.php/dav/public-files/{self._token}"
+        prefix = "/public.php/webdav"
         entries = []
 
         for response in root_el.findall("d:response", _NS):
@@ -514,9 +522,9 @@ class NextcloudScraper:
         return entries
 
     def _download_url(self, nc_path: str) -> str:
-        """Build the Nextcloud share-download URL for a file path."""
+        """Build the WebDAV direct-download URL for a file path."""
         from urllib.parse import quote
-        return f"{self._base}/index.php/s/{self._token}/download?path={quote(nc_path)}"
+        return f"{self._base}/public.php/webdav{quote(nc_path)}"
 
     # ------------------------------------------------------------------
     # Public interface (mirrors DirectoryScraper)
@@ -591,7 +599,8 @@ def _sha256_file(path: Path) -> str:
 
 
 def _download_file(entry: DirectoryEntry, session: NetworkSession,
-                   governance: DataGovernance, run_id: str) -> dict:
+                   governance: DataGovernance, run_id: str,
+                   auth: tuple[str, str] | None = None) -> dict:
     row = {
         "run_id": run_id,
         "dataset": entry.hierarchy[0] if entry.hierarchy else "unknown",
@@ -615,7 +624,7 @@ def _download_file(entry: DirectoryEntry, session: NetworkSession,
             return row
 
     try:
-        bytes_written, file_hash = session.stream_download(entry.url, local)
+        bytes_written, file_hash = session.stream_download(entry.url, local, auth=auth)
     except RFBConnectionError as exc:
         row["error_message"] = str(exc)
         logger.error("Connection error: %s — %s", entry.name, exc)
@@ -675,7 +684,7 @@ def run(
         if portal == "apache":
             selection = {ds: None for ds in APACHE_DATASETS}
         else:
-            selection = {"Cadastros": None}
+            selection = {ds: None for ds in APACHE_DATASETS}
 
     with NetworkSession() as session:
         scraper: DirectoryScraper | NextcloudScraper = (
@@ -724,9 +733,13 @@ def run(
 
             logger.info("%s: %d files found", dataset, len(entries))
 
+            download_auth: tuple[str, str] | None = (
+                (NC_SHARE_TOKEN, "") if portal == "nextcloud" else None
+            )
+
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
                 futures = {
-                    pool.submit(_download_file, e, session, governance, run_id): e
+                    pool.submit(_download_file, e, session, governance, run_id, download_auth): e
                     for e in entries
                 }
                 for future in as_completed(futures):

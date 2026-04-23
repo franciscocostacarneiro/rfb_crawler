@@ -14,11 +14,22 @@ from pathlib import Path
 
 import requests
 
-from crawler.config import BASE_URL, DATASETS, DOWNLOAD_DIR, MAX_WORKERS, WEBHOOK_URL
+from crawler.config import (
+    APACHE_BASE_URL,
+    BASE_URL,
+    DATASETS,
+    DOWNLOAD_DIR,
+    MAX_WORKERS,
+    NC_BASE_URL,
+    NC_SHARE_ROOT,
+    NC_SHARE_TOKEN,
+    PORTAL,
+    WEBHOOK_URL,
+)
 from crawler.exceptions import DiskFullError, RFBConnectionError, SchemaChangeError
 from crawler.filesystem import DataGovernance
 from crawler.network import NetworkSession
-from crawler.scraper import DirectoryEntry, DirectoryScraper
+from crawler.scraper import DirectoryEntry, DirectoryScraper, NextcloudScraper
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,6 +48,7 @@ def _download_file(
     session: NetworkSession,
     governance: DataGovernance,
     run_id: str,
+    auth: tuple[str, str] | None = None,
 ) -> dict:
     """Download one file and return a log-row dict."""
     log_row = {
@@ -65,7 +77,7 @@ def _download_file(
             return log_row
 
     try:
-        bytes_written, file_hash = session.stream_download(entry.url, local_path)
+        bytes_written, file_hash = session.stream_download(entry.url, local_path, auth=auth)
     except RFBConnectionError as exc:
         log_row["error_message"] = str(exc)
         logger.error("Connection error downloading %s: %s", entry.name, exc)
@@ -108,18 +120,25 @@ def _sha256_file(path: Path) -> str:
 
 def _process_dataset(
     dataset: str,
-    scraper: DirectoryScraper,
+    scraper: DirectoryScraper | NextcloudScraper,
     session: NetworkSession,
     governance: DataGovernance,
     run_id: str,
+    portal: str = "apache",
 ) -> tuple[list[dict], dict]:
     """Crawl one dataset and download all new files. Returns (log_rows, stats)."""
-    url = f"{BASE_URL}/{dataset}/"
+    if portal == "nextcloud":
+        crawl_path = f"{NC_SHARE_ROOT}/{dataset}"
+        entries_iter = scraper.crawl(crawl_path, dataset)  # type: ignore[union-attr]
+    else:
+        url = f"{APACHE_BASE_URL}/{dataset}/"
+        entries_iter = scraper.crawl(url, dataset)  # type: ignore[union-attr]
+
     stats = {"dataset": dataset, "new": 0, "skipped": 0, "errors": 0, "bytes": 0}
     log_rows: list[dict] = []
 
     try:
-        entries = list(scraper.crawl(url, dataset))
+        entries = list(entries_iter)
     except SchemaChangeError as exc:
         logger.error("Schema change detected for %s: %s", dataset, exc)
         stats["errors"] += 1
@@ -131,9 +150,13 @@ def _process_dataset(
 
     logger.info("Dataset %s: %d files found", dataset, len(entries))
 
+    download_auth: tuple[str, str] | None = None
+    if portal == "nextcloud":
+        download_auth = (NC_SHARE_TOKEN, "")
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {
-            pool.submit(_download_file, entry, session, governance, run_id): entry
+            pool.submit(_download_file, entry, session, governance, run_id, download_auth): entry
             for entry in entries
         }
         for future in as_completed(futures):
@@ -167,10 +190,14 @@ def _notify_webhook(message: str) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run(datasets: list[str] | None = None, download_dir: Path = DOWNLOAD_DIR) -> None:
+def run(
+    datasets: list[str] | None = None,
+    download_dir: Path = DOWNLOAD_DIR,
+    portal: str = PORTAL,
+) -> None:
     run_id = uuid.uuid4().hex[:8]
     started_at = time.monotonic()
-    logger.info("=== RFB Crawler started | run_id=%s ===", run_id)
+    logger.info("=== RFB Crawler started | run_id=%s portal=%s ===", run_id, portal)
 
     governance = DataGovernance(root=download_dir)
     all_log_rows: list[dict] = []
@@ -179,12 +206,20 @@ def run(datasets: list[str] | None = None, download_dir: Path = DOWNLOAD_DIR) ->
     target_datasets = datasets or DATASETS
 
     with NetworkSession() as session:
-        scraper = DirectoryScraper(session)
+        if portal == "nextcloud":
+            scraper: DirectoryScraper | NextcloudScraper = NextcloudScraper(
+                session=session,
+                base_url=NC_BASE_URL,
+                share_token=NC_SHARE_TOKEN,
+                share_root=NC_SHARE_ROOT,
+            )
+        else:
+            scraper = DirectoryScraper(session)
 
         for dataset in target_datasets:
             logger.info("--- Processing dataset: %s ---", dataset)
             log_rows, stats = _process_dataset(
-                dataset, scraper, session, governance, run_id
+                dataset, scraper, session, governance, run_id, portal=portal
             )
             all_log_rows.extend(log_rows)
             all_stats.append(stats)

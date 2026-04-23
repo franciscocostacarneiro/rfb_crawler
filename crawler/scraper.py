@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -179,5 +180,175 @@ class DirectoryScraper:
                     parent_folder=parent_folder,
                     size_bytes=entry["size_bytes"],
                     modified=entry["modified"],
+                    hierarchy=list(hierarchy),
+                )
+
+
+# ---------------------------------------------------------------------------
+# Nextcloud WebDAV scraper
+# ---------------------------------------------------------------------------
+
+_PROPFIND_BODY = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<d:propfind xmlns:d="DAV:">'
+    "<d:prop>"
+    "<d:displayname/><d:resourcetype/><d:getcontentlength/><d:getlastmodified/>"
+    "</d:prop>"
+    "</d:propfind>"
+)
+_NS = {"d": "DAV:"}
+_WEBDAV_PREFIX = "/public.php/webdav"
+
+
+class NextcloudScraper:
+    """DFS crawler for Nextcloud public-share portals via WebDAV PROPFIND.
+
+    Authentication uses the share token as the Basic-auth username with an
+    empty password, which is the standard Nextcloud mechanism for public shares.
+    """
+
+    def __init__(
+        self,
+        session: "NetworkSession",  # type: ignore[name-defined]  # noqa: F821
+        base_url: str,
+        share_token: str,
+        share_root: str,
+    ) -> None:
+        self._session = session
+        self._base = base_url.rstrip("/")
+        self._token = share_token
+        self._share_root = share_root  # e.g. "/Dados/Cadastros"
+        self._webdav_root = f"{self._base}{_WEBDAV_PREFIX}"
+        self._auth = (share_token, "")
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _propfind(self, nc_path: str) -> list[dict]:
+        url = self._webdav_root + nc_path.rstrip("/") + "/"
+        resp = self._session.propfind(url, _PROPFIND_BODY, auth=self._auth)
+        return self._parse_xml(resp.text, nc_path)
+
+    def _parse_xml(self, xml_text: str, base_path: str) -> list[dict]:
+        try:
+            root_el = ET.fromstring(xml_text)
+        except ET.ParseError as exc:
+            raise SchemaChangeError(f"Cannot parse WebDAV XML: {exc}") from exc
+
+        entries = []
+        for response in root_el.findall("d:response", _NS):
+            href_el = response.find("d:href", _NS)
+            if href_el is None or not href_el.text:
+                continue
+            href = href_el.text
+
+            # Strip the WebDAV prefix to get the share-relative path
+            if href.startswith(_WEBDAV_PREFIX):
+                item_path = href[len(_WEBDAV_PREFIX):]
+            else:
+                item_path = href
+            item_path = item_path.rstrip("/")
+
+            # Skip the parent directory itself
+            if item_path == base_path.rstrip("/"):
+                continue
+
+            propstat = response.find("d:propstat", _NS)
+            if propstat is None:
+                continue
+            prop = propstat.find("d:prop", _NS)
+            if prop is None:
+                continue
+
+            rt = prop.find("d:resourcetype", _NS)
+            is_dir = rt is not None and rt.find("d:collection", _NS) is not None
+
+            name_el = prop.find("d:displayname", _NS)
+            name = (name_el.text or "").strip() if name_el is not None else ""
+            if not name:
+                name = item_path.split("/")[-1]
+            if not name:
+                continue
+
+            size_el = prop.find("d:getcontentlength", _NS)
+            size_bytes: int | None = None
+            if size_el is not None and size_el.text:
+                try:
+                    size_bytes = int(size_el.text)
+                except ValueError:
+                    pass
+
+            modified_el = prop.find("d:getlastmodified", _NS)
+            modified = modified_el.text if modified_el is not None else None
+
+            entries.append(
+                {
+                    "name": name,
+                    "path": item_path,
+                    "is_dir": is_dir,
+                    "size_bytes": size_bytes,
+                    "modified": modified,
+                }
+            )
+        return entries
+
+    def _download_url(self, nc_path: str) -> str:
+        """Build the WebDAV direct-download URL for a file path."""
+        return f"{self._base}/public.php/webdav{quote(nc_path)}"
+
+    # ------------------------------------------------------------------
+    # Public interface (mirrors DirectoryScraper)
+    # ------------------------------------------------------------------
+
+    def list_directory(self, nc_path: str) -> list[dict]:
+        entries = self._propfind(nc_path)
+        return [
+            {
+                "name": e["name"],
+                "url": self._download_url(e["path"]) if not e["is_dir"] else None,
+                "is_dir": e["is_dir"],
+                "modified": e["modified"],
+                "size_bytes": e["size_bytes"],
+                "path": e["path"],
+            }
+            for e in entries
+        ]
+
+    def crawl(
+        self,
+        nc_path: str,
+        dataset_name: str,
+        hierarchy: list[str] | None = None,
+    ):
+        """DFS crawl starting at *nc_path*. Yields DirectoryEntry for each file."""
+        if hierarchy is None:
+            hierarchy = [dataset_name]
+
+        logger.info("Scanning (Nextcloud) %s", nc_path)
+        try:
+            entries = self._propfind(nc_path)
+        except RFBConnectionError as exc:
+            logger.error("Cannot list %s: %s", nc_path, exc)
+            return
+
+        if not entries and hierarchy == [dataset_name]:
+            raise SchemaChangeError(
+                f"No entries at {nc_path} — portal structure may have changed."
+            )
+
+        for e in entries:
+            if e["is_dir"]:
+                yield from self.crawl(
+                    e["path"], dataset_name, hierarchy + [e["name"]]
+                )
+            else:
+                yield DirectoryEntry(
+                    name=e["name"],
+                    url=self._download_url(e["path"]),
+                    is_dir=False,
+                    parent_folder=hierarchy[-1] if len(hierarchy) > 1 else dataset_name,
+                    size_bytes=e["size_bytes"],
+                    modified=e["modified"],
                     hierarchy=list(hierarchy),
                 )
