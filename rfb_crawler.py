@@ -1,6 +1,6 @@
 """
 RFB Crawler — single-file version.
-Crawls CAFIR, CNO, CNPJ and SISEN from https://dadosabertos.rfb.gov.br/
+Acessa dados públicos da Receita Federal via Nextcloud (arquivos.receitafederal.gov.br).
 """
 
 from __future__ import annotations
@@ -12,7 +12,6 @@ import csv
 import hashlib
 import json
 import logging
-import re
 import shutil
 import sys
 import time
@@ -21,7 +20,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urljoin
 
 # ---------------------------------------------------------------------------
 # Third-party
@@ -29,7 +27,6 @@ from urllib.parse import urljoin
 import xml.etree.ElementTree as ET
 
 import requests
-from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -37,18 +34,10 @@ from urllib3.util.retry import Retry
 # CONFIG
 # ===========================================================================
 
-# --- Portal 1: Apache Directory Listing ---
-APACHE_BASE_URL = "https://dadosabertos.rfb.gov.br"
-APACHE_DATASETS = ["CNPJ", "CAFIR", "CNO", "SISEN"]
-
-# --- Portal 2: Nextcloud Public Share ---
+# --- Portal: Nextcloud Public Share ---
 NC_BASE_URL = "https://arquivos.receitafederal.gov.br"
 NC_SHARE_TOKEN = "gn672Ad4CF8N6TK"
-NC_SHARE_ROOT = "/Dados/Cadastros"   # path inside the share
-
-# Active portal constants (overridden at runtime by user selection)
-BASE_URL = APACHE_BASE_URL
-DATASETS = APACHE_DATASETS
+NC_SHARE_ROOT = ""   # raiz do compartilhamento público (listagem completa)
 
 DOWNLOAD_DIR = Path("data")
 MAX_WORKERS = 3
@@ -194,69 +183,6 @@ class NetworkSession:
 # SCRAPER
 # ===========================================================================
 
-_SKIP_HREFS = {"../", "/", "?C=N;O=D", "?C=M;O=A", "?C=S;O=A", "?C=D;O=A"}
-
-
-def _parse_size(raw: str) -> int | None:
-    raw = raw.strip()
-    if not raw or raw == "-":
-        return None
-    units = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
-    m = re.fullmatch(r"([\d.]+)\s*([KMGT]?)", raw, re.IGNORECASE)
-    if not m:
-        return None
-    return int(float(m.group(1)) * units.get(m.group(2).upper(), 1))
-
-
-def _parse_listing(html: str, base_url: str) -> list[dict]:
-    soup = BeautifulSoup(html, "lxml")
-    raw = []
-
-    rows = soup.select("table tr")
-    if rows:
-        for row in rows:
-            cells = row.find_all("td")
-            anchor = (cells[0].find("a") if cells else None) or row.find("a")
-            if not anchor:
-                continue
-            href = anchor.get("href", "")
-            if href in _SKIP_HREFS or href.startswith(("?", "/")):
-                continue
-            raw.append({
-                "name": anchor.get_text(strip=True),
-                "href": href,
-                "modified": cells[1].get_text(strip=True) if len(cells) > 1 else None,
-                "size_raw": cells[2].get_text(strip=True) if len(cells) > 2 else None,
-            })
-    else:
-        pre = soup.find("pre")
-        anchors = pre.find_all("a", href=True) if pre else soup.find_all("a", href=True)
-        for anchor in anchors:
-            href = anchor["href"]
-            if href in _SKIP_HREFS or href.startswith(("?", "/")):
-                continue
-            sibling_text = "".join(
-                str(s) for s in anchor.next_siblings if not getattr(s, "name", None)
-            )
-            parts = sibling_text.split()
-            raw.append({
-                "name": anchor.get_text(strip=True),
-                "href": href,
-                "modified": " ".join(parts[:2]) if len(parts) >= 2 else None,
-                "size_raw": parts[2] if len(parts) >= 3 else None,
-            })
-
-    return [
-        {
-            "name": e["name"].rstrip("/"),
-            "url": urljoin(base_url, e["href"]),
-            "is_dir": e["href"].endswith("/"),
-            "modified": e.get("modified"),
-            "size_bytes": _parse_size(e.get("size_raw") or ""),
-        }
-        for e in raw
-    ]
-
 
 @dataclass
 class DirectoryEntry:
@@ -268,43 +194,6 @@ class DirectoryEntry:
     modified: str | None = None
     hierarchy: list[str] = field(default_factory=list)
 
-
-class DirectoryScraper:
-    def __init__(self, session: NetworkSession) -> None:
-        self._session = session
-
-    def list_directory(self, url: str) -> list[dict]:
-        return _parse_listing(self._session.get(url).text, url)
-
-    def crawl(self, base_url: str, dataset: str, hierarchy: list[str] | None = None):
-        if hierarchy is None:
-            hierarchy = [dataset]
-
-        logger.info("Scanning %s", base_url)
-        try:
-            entries = self.list_directory(base_url)
-        except RFBConnectionError as exc:
-            logger.error("Cannot list %s: %s", base_url, exc)
-            return
-
-        if not entries and hierarchy == [dataset]:
-            raise SchemaChangeError(
-                f"No entries at {base_url} — portal structure may have changed."
-            )
-
-        for e in entries:
-            if e["is_dir"]:
-                yield from self.crawl(e["url"], dataset, hierarchy + [e["name"]])
-            else:
-                yield DirectoryEntry(
-                    name=e["name"],
-                    url=e["url"],
-                    is_dir=False,
-                    parent_folder=hierarchy[-1] if len(hierarchy) > 1 else dataset,
-                    size_bytes=e["size_bytes"],
-                    modified=e["modified"],
-                    hierarchy=list(hierarchy),
-                )
 
 # ===========================================================================
 # DATA GOVERNANCE (filesystem layer)
@@ -325,6 +214,8 @@ class DataGovernance:
         self._catalog_path = root / "catalog.json"
         self._log_path = root / "execution_log.csv"
         self._manifest: dict = self._load_manifest()
+        # Secondary index: source_url → manifest record (for fast incremental checks)
+        self._url_index: dict = self._build_url_index()
 
     def _load_manifest(self) -> dict:
         if self._manifest_path.exists():
@@ -334,6 +225,14 @@ class DataGovernance:
                 logger.warning("Manifest corrupted — starting fresh.")
         return {}
 
+    def _build_url_index(self) -> dict:
+        """Build a secondary index: source_url → manifest record."""
+        return {
+            rec["source_url"]: rec
+            for rec in self._manifest.values()
+            if "source_url" in rec
+        }
+
     def save_manifest(self) -> None:
         self._manifest_path.write_text(
             json.dumps(self._manifest, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -342,18 +241,39 @@ class DataGovernance:
     def is_known(self, file_hash: str) -> bool:
         return file_hash in self._manifest
 
+    def is_unchanged(self, entry: DirectoryEntry) -> bool:
+        """Return True when the remote file metadata matches the manifest record.
+
+        Uses WebDAV size + last-modified as a lightweight fingerprint to avoid
+        re-downloading and re-hashing files that haven't changed on the server.
+        Requires the local file to still exist on disk.
+        """
+        rec = self._url_index.get(entry.url)
+        if rec is None:
+            return False
+        if entry.size_bytes is None or rec.get("remote_size_bytes") != entry.size_bytes:
+            return False
+        if entry.modified is None or rec.get("remote_modified") != entry.modified:
+            return False
+        local_path = self.root / rec["local_path"]
+        return local_path.exists()
+
     def register_file(self, entry: DirectoryEntry, local_path: Path,
                       file_hash: str, bytes_written: int) -> None:
-        self._manifest[file_hash] = {
+        record = {
             "name": entry.name,
             "source_url": entry.url,
             "parent_folder": entry.parent_folder,
             "hierarchy": entry.hierarchy,
             "local_path": str(local_path.relative_to(self.root)),
             "size_bytes": bytes_written,
+            "remote_size_bytes": entry.size_bytes,
+            "remote_modified": entry.modified,
             "file_hash": file_hash,
             "download_timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        self._manifest[file_hash] = record
+        self._url_index[entry.url] = record
 
     def update_catalog(self) -> None:
         catalog: dict = {}
@@ -616,11 +536,21 @@ def _download_file(entry: DirectoryEntry, session: NetworkSession,
 
     local = governance.resolve_local_path(entry)
 
+    # Fast incremental check: compare WebDAV metadata (size + modified) against
+    # the manifest — no local hashing needed when the remote file is unchanged.
+    if governance.is_unchanged(entry):
+        stored = governance._url_index[entry.url]
+        row.update(status="skipped", file_hash=stored.get("file_hash", ""))
+        logger.debug("Skipped (unchanged): %s", entry.name)
+        return row
+
+    # Fallback: if the file exists locally but metadata is missing/mismatched,
+    # hash the local copy before re-downloading.
     if local.exists():
         h = _sha256_file(local)
         if governance.is_known(h):
             row.update(status="skipped", file_hash=h)
-            logger.debug("Skipped (cached): %s", entry.name)
+            logger.debug("Skipped (hash match): %s", entry.name)
             return row
 
     try:
@@ -660,107 +590,118 @@ def _notify_webhook(message: str) -> None:
         logger.warning("Webhook failed: %s", exc)
 
 
-def run(
-    selection: dict[str, list[str] | None] | None = None,
-    download_dir: Path = DOWNLOAD_DIR,
-    portal: str = "apache",
-) -> None:
-    """Run the crawler.
+# Prefix stripped when converting a server NC path to a local hierarchy.
+# Keeps backward-compatible folder layout: /Dados/Cadastros/CNPJ → ["CNPJ"].
+_NC_KNOWN_PREFIX = "/Dados/Cadastros"
 
-    selection: dict mapping dataset -> list of subfolder names to download
-               (None = download entire dataset). If selection itself is None,
-               all DATASETS are downloaded entirely.
-    portal: "apache" or "nextcloud".
+
+def _nc_hierarchy(nc_path: str) -> list[str]:
+    """Map a server NC path to the initial local hierarchy list for DataGovernance.
+
+    Strips the known /Dados/Cadastros prefix so that e.g.
+    /Dados/Cadastros/CNPJ/2026-04  →  ['CNPJ', '2026-04'],
+    maintaining backward-compatible local folder structure.
+    For paths outside this prefix all components are used.
     """
+    path = nc_path.rstrip("/")
+    if path.startswith(_NC_KNOWN_PREFIX):
+        path = path[len(_NC_KNOWN_PREFIX):]
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        # Fallback: use the last component of the original path
+        orig_parts = [p for p in nc_path.strip("/").split("/") if p]
+        parts = [orig_parts[-1]] if orig_parts else ["dados"]
+    return parts
+
+
+def run(
+    nc_paths: list[dict | str] | None = None,
+    download_dir: Path = DOWNLOAD_DIR,
+) -> None:
+    """Run the crawler with Nextcloud paths chosen via the folder browser."""
     run_id = uuid.uuid4().hex[:8]
     t0 = time.monotonic()
-    logger.info("=== RFB Crawler started | run_id=%s portal=%s ===", run_id, portal)
+    logger.info("=== RFB Crawler started | run_id=%s ===", run_id)
 
     governance = DataGovernance(root=download_dir)
     all_rows: list[dict] = []
     all_stats: list[dict] = []
 
-    if selection is None:
-        if portal == "apache":
-            selection = {ds: None for ds in APACHE_DATASETS}
-        else:
-            selection = {ds: None for ds in APACHE_DATASETS}
-
     with NetworkSession() as session:
-        scraper: DirectoryScraper | NextcloudScraper = (
-            DirectoryScraper(session) if portal == "apache" else NextcloudScraper(session)
-        )
+        scraper = NextcloudScraper(session)
+        download_auth: tuple[str, str] = (NC_SHARE_TOKEN, "")
 
-        for dataset, subfolders in selection.items():
-            label = dataset if not subfolders else f"{dataset} ({', '.join(subfolders)})"
-            logger.info("--- Dataset: %s ---", label)
-            stats = {"dataset": dataset, "new": 0, "skipped": 0, "errors": 0, "bytes": 0}
+        if nc_paths is not None:
+            # ── Free-path mode: crawl each NC path chosen in the browser ──────────
+            for nc_item in nc_paths:
+                # Support both plain strings (legacy) and dicts from the browser
+                if isinstance(nc_item, dict):
+                    nc_path = nc_item["path"]
+                    is_dir = nc_item["is_dir"]
+                else:
+                    nc_path = nc_item
+                    is_dir = True  # assume directory for plain-string paths
+                hier = _nc_hierarchy(nc_path)
+                dataset_name = hier[0]
+                logger.info("--- NC path: %s  (é pasta: %s)  →  local: %s ---", nc_path, is_dir, "/".join(hier))
+                stats = {"dataset": dataset_name, "new": 0, "skipped": 0, "errors": 0, "bytes": 0}
 
-            entries: list[DirectoryEntry] = []
-            try:
-                if portal == "apache":
-                    if subfolders:
-                        for sub in subfolders:
-                            sub_url = f"{APACHE_BASE_URL}/{dataset}/{sub}/"
-                            entries.extend(
-                                scraper.crawl(sub_url, dataset, [dataset, sub])
-                            )
-                    else:
-                        entries.extend(
-                            scraper.crawl(f"{APACHE_BASE_URL}/{dataset}/", dataset)
-                        )
-                else:  # nextcloud
-                    if subfolders:
-                        for sub in subfolders:
-                            nc_path = f"{NC_SHARE_ROOT}/{dataset}/{sub}"
-                            entries.extend(
-                                scraper.crawl(nc_path, dataset, [dataset, sub])
-                            )
-                    else:
-                        entries.extend(
-                            scraper.crawl(f"{NC_SHARE_ROOT}/{dataset}", dataset)
-                        )
-            except SchemaChangeError as exc:
-                logger.error("Schema change in %s: %s", dataset, exc)
-                stats["errors"] += 1
-                all_stats.append(stats)
-                continue
-            except RFBConnectionError as exc:
-                logger.error("Cannot crawl %s: %s", dataset, exc)
-                stats["errors"] += 1
-                all_stats.append(stats)
-                continue
-
-            logger.info("%s: %d files found", dataset, len(entries))
-
-            download_auth: tuple[str, str] | None = (
-                (NC_SHARE_TOKEN, "") if portal == "nextcloud" else None
-            )
-
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-                futures = {
-                    pool.submit(_download_file, e, session, governance, run_id, download_auth): e
-                    for e in entries
-                }
-                for future in as_completed(futures):
-                    row = future.result()
-                    all_rows.append(row)
-                    if row["status"] == "new":
-                        stats["new"] += 1
-                        stats["bytes"] += row.get("size_bytes") or 0
-                    elif row["status"] == "skipped":
-                        stats["skipped"] += 1
-                    else:
+                entries: list[DirectoryEntry] = []
+                if not is_dir:
+                    # Direct file — build a single DirectoryEntry without PROPFIND crawl
+                    file_name = hier[-1] if hier else nc_path.split("/")[-1]
+                    file_hier = hier[:-1] if len(hier) > 1 else hier
+                    parent = file_hier[-1] if file_hier else dataset_name
+                    entry_size = nc_item.get("size_bytes") if isinstance(nc_item, dict) else None
+                    entry_mod  = nc_item.get("modified")   if isinstance(nc_item, dict) else None
+                    entries = [DirectoryEntry(
+                        name=file_name,
+                        url=f"{NC_BASE_URL}/public.php/webdav{nc_path}",
+                        is_dir=False,
+                        parent_folder=parent,
+                        size_bytes=entry_size,
+                        modified=entry_mod,
+                        hierarchy=file_hier,
+                    )]
+                else:
+                    try:
+                        entries = list(scraper.crawl(nc_path, dataset_name, hier))
+                    except SchemaChangeError as exc:
+                        logger.error("Schema change at %s: %s", nc_path, exc)
                         stats["errors"] += 1
+                        all_stats.append(stats)
+                        continue
+                    except RFBConnectionError as exc:
+                        logger.error("Cannot crawl %s: %s", nc_path, exc)
+                        stats["errors"] += 1
+                        all_stats.append(stats)
+                        continue
 
-            if stats["new"] > 0:
-                _notify_webhook(
-                    f"[RFB Crawler] {dataset}: {stats['new']} new file(s), "
-                    f"{stats['bytes'] / 1e9:.2f} GB"
-                )
+                logger.info("%s: %d files found", nc_path, len(entries))
 
-            governance.apply_retention(dataset)
-            all_stats.append(stats)
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                    futures = {
+                        pool.submit(_download_file, e, session, governance, run_id, download_auth): e
+                        for e in entries
+                    }
+                    for future in as_completed(futures):
+                        row = future.result()
+                        all_rows.append(row)
+                        if row["status"] == "new":
+                            stats["new"] += 1
+                            stats["bytes"] += row.get("size_bytes") or 0
+                        elif row["status"] == "skipped":
+                            stats["skipped"] += 1
+                        else:
+                            stats["errors"] += 1
+
+                if stats["new"] > 0:
+                    _notify_webhook(
+                        f"[RFB Crawler] {dataset_name}: {stats['new']} new file(s), "
+                        f"{stats['bytes'] / 1e9:.2f} GB"
+                    )
+                governance.apply_retention(dataset_name)
+                all_stats.append(stats)
 
     governance.save_manifest()
     governance.update_catalog()
@@ -790,6 +731,23 @@ def run(
     print(f"  Log     → {log_path}")
     print(f"  Catalog → {governance._catalog_path}")
     print("=" * 60 + "\n")
+
+    # GUI notification when no new files were found (base already up to date)
+    if total_new == 0 and total_err == 0:
+        try:
+            from tkinter import messagebox
+            root = _gui_root()
+            messagebox.showinfo(
+                "RFB Crawler — Base já atualizada",
+                "Nenhum arquivo novo foi encontrado para os datasets selecionados.\n\n"
+                f"Arquivos verificados: {total_skip}\n"
+                "Todos os arquivos locais já estão completos e atualizados.\n\n"
+                "Não há nada para incrementar.",
+                parent=root,
+            )
+            root.destroy()
+        except Exception:
+            pass  # Non-GUI context; the console summary is sufficient
 
 
 # ===========================================================================
@@ -901,60 +859,10 @@ def _show_error(title: str, message: str) -> None:
 
 
 
-def _ask_portal() -> str:
-    """Ask user which portal to use. Returns 'apache' or 'nextcloud'."""
-    import tkinter as tk
-    from tkinter import ttk
-
-    win = tk.Tk()
-    win.title("RFB Crawler — Selecione o Portal")
-    win.geometry("520x260")
-    win.resizable(False, False)
-    win.attributes("-topmost", True)
-    result: dict[str, str | None] = {"portal": None}
-
-    ttk.Label(
-        win,
-        text="Selecione o portal de dados da Receita Federal:",
-        font=("Segoe UI", 11, "bold"),
-        wraplength=480,
-    ).pack(padx=20, pady=(24, 10))
-
-    btn_frame = ttk.Frame(win)
-    btn_frame.pack(padx=20, pady=6, fill="x")
-
-    def pick(portal: str) -> None:
-        result["portal"] = portal
-        win.destroy()
-
-    ttk.Button(
-        btn_frame,
-        text="dadosabertos.rfb.gov.br  (Apache — CNPJ, CAFIR, CNO, SISEN)",
-        command=lambda: pick("apache"),
-    ).pack(pady=5, fill="x")
-
-    ttk.Button(
-        btn_frame,
-        text="arquivos.receitafederal.gov.br  (Nextcloud — /Dados/Cadastros)",
-        command=lambda: pick("nextcloud"),
-    ).pack(pady=5, fill="x")
-
-    win.protocol("WM_DELETE_WINDOW", lambda: sys.exit(0))
-    win.mainloop()
-
-    if result["portal"] is None:
-        sys.exit(0)
-    return result["portal"]
-
-
-def _ensure_connectivity(portal: str) -> None:
-    """Pre-flight check for the chosen portal. Aborts with GUI message if unreachable."""
-    if portal == "apache":
-        check_url = APACHE_BASE_URL + "/"
-        domain = "dadosabertos.rfb.gov.br"
-    else:
-        check_url = NC_BASE_URL + "/"
-        domain = "arquivos.receitafederal.gov.br"
+def _ensure_connectivity() -> None:
+    """Pre-flight check for the Nextcloud portal. Aborts with GUI message if unreachable."""
+    check_url = NC_BASE_URL + "/"
+    domain = "arquivos.receitafederal.gov.br"
 
     print(f"Verificando conectividade com {check_url} ...")
     ok, info = _check_connectivity(check_url)
@@ -986,226 +894,235 @@ def _ensure_connectivity(portal: str) -> None:
     sys.exit(2)
 
 
-def _pick_from_list(
-    title: str,
-    prompt: str,
-    items: list[tuple[str, str]],
-    preselect_all: bool = False,
-) -> list[str]:
-    """Show a multi-select listbox dialog and return the chosen item *values*.
+# ===========================================================================
+# NEXTCLOUD FOLDER BROWSER
+# ===========================================================================
 
-    items is a list of (value, display_label) tuples.
-    Returns [] if the user cancels.
+def _browse_nextcloud(session: NetworkSession) -> list[dict]:
+    """Interactive two-pane folder browser for the Nextcloud share.
+
+    Left pane: navigable directory listing (double-click or "Entrar" to descend).
+    Right pane: download queue the user builds up by clicking "+ Adicionar à fila".
+
+    Returns list of dicts {path, is_dir, name, size_bytes, modified} for each
+    queued item, or [] if cancelled.
     """
     import tkinter as tk
     from tkinter import ttk, messagebox
 
-    if not items:
-        return []
+    scraper = NextcloudScraper(session)
 
+    # ── Mutable state ────────────────────────────────────────────────────────
+    nav_stack: list[str] = []              # history for "Back"
+    state: dict = {"path": "", "entries": []}
+    queue: list[dict] = []                 # items selected for download
+    result: dict = {"paths": None}
+
+    # ── Window ───────────────────────────────────────────────────────────────
     win = tk.Tk()
-    win.title(title)
-    win.geometry("560x460")
+    win.title("RFB Crawler — Seleção de pastas para download")
+    win.geometry("880x580")
+    win.minsize(640, 420)
+    win.resizable(True, True)
     win.attributes("-topmost", True)
-    win.lift()
 
-    result: dict = {"values": None}
+    # ── Top bar: current path + Back button ──────────────────────────────────
+    top_bar = ttk.Frame(win)
+    top_bar.pack(fill="x", padx=10, pady=(10, 2))
+    ttk.Label(top_bar, text="Pasta atual:", font=("Segoe UI", 9, "bold")).pack(side="left")
+    path_var = tk.StringVar()
+    ttk.Label(top_bar, textvariable=path_var, foreground="#1a4b9e",
+              font=("Segoe UI", 9)).pack(side="left", padx=(6, 0))
+    btn_back = ttk.Button(top_bar, text="← Voltar", state="disabled")
+    btn_back.pack(side="right")
 
-    ttk.Label(win, text=prompt, wraplength=540, justify="left").pack(
-        padx=12, pady=(12, 6), anchor="w"
-    )
     ttk.Label(
         win,
-        text="(Use Ctrl+clique para escolher vários, Shift+clique para intervalo.)",
-        foreground="#666",
-    ).pack(padx=12, anchor="w")
+        text=(
+            "Dica: dê duplo clique em uma pasta para entrar nela. "
+            "Selecione um ou mais itens e clique em \"+ Adicionar à fila\" para programar o download."
+        ),
+        foreground="#555", wraplength=840, font=("Segoe UI", 8),
+    ).pack(padx=10, anchor="w")
 
-    frame = ttk.Frame(win)
-    frame.pack(fill="both", expand=True, padx=12, pady=8)
+    # ── Two-pane layout ──────────────────────────────────────────────────────
+    pw = ttk.PanedWindow(win, orient="horizontal")
+    pw.pack(fill="both", expand=True, padx=10, pady=6)
 
-    scrollbar = ttk.Scrollbar(frame, orient="vertical")
-    listbox = tk.Listbox(
-        frame,
-        selectmode="extended",
-        yscrollcommand=scrollbar.set,
-        activestyle="dotbox",
-        font=("Consolas", 10),
-    )
-    scrollbar.config(command=listbox.yview)
-    scrollbar.pack(side="right", fill="y")
-    listbox.pack(side="left", fill="both", expand=True)
+    # Left: directory listing
+    lf = ttk.LabelFrame(pw, text="Conteúdo da pasta")
+    pw.add(lf, weight=3)
+    dir_sb = ttk.Scrollbar(lf, orient="vertical")
+    dir_lb = tk.Listbox(lf, selectmode="extended", yscrollcommand=dir_sb.set,
+                        font=("Consolas", 9), activestyle="dotbox")
+    dir_sb.config(command=dir_lb.yview)
+    dir_sb.pack(side="right", fill="y")
+    dir_lb.pack(fill="both", expand=True)
 
-    for _, label in items:
-        listbox.insert("end", label)
+    # Right: download queue
+    rf = ttk.LabelFrame(pw, text="Fila de download (0 itens)")
+    pw.add(rf, weight=2)
+    q_sb = ttk.Scrollbar(rf, orient="vertical")
+    q_lb = tk.Listbox(rf, yscrollcommand=q_sb.set, font=("Consolas", 8),
+                      activestyle="dotbox")
+    q_sb.config(command=q_lb.yview)
+    q_sb.pack(side="right", fill="y")
+    q_lb.pack(fill="both", expand=True)
+    ttk.Button(rf, text="✕ Remover da fila",
+               command=lambda: _remove()).pack(padx=4, pady=(4, 2), fill="x")
 
-    if preselect_all:
-        listbox.select_set(0, "end")
+    # ── Action buttons ───────────────────────────────────────────────────────
+    bf = ttk.Frame(win)
+    bf.pack(fill="x", padx=10, pady=(0, 8))
+    btn_enter = ttk.Button(bf, text="↓ Entrar na pasta")
+    btn_enter.pack(side="left")
+    btn_add = ttk.Button(bf, text="+ Adicionar à fila")
+    btn_add.pack(side="left", padx=6)
+    ttk.Button(bf, text="Cancelar",
+               command=lambda: win.destroy()).pack(side="right")
+    ttk.Button(bf, text="✓ Confirmar download",
+               command=lambda: _confirm()).pack(side="right", padx=6)
 
-    def _select_all() -> None:
-        listbox.select_set(0, "end")
+    # ── Helper functions ─────────────────────────────────────────────────────
+    def _entry_label(e: dict) -> str:
+        icon = "📁" if e["is_dir"] else "📄"
+        label = f"{icon}  {e['name']}"
+        if e.get("modified"):
+            label += f"   [{e['modified'][:16]}]"
+        if not e["is_dir"] and e.get("size_bytes"):
+            mb = e["size_bytes"] / 1e6
+            label += f"   ({mb:.1f} MB)" if mb < 1024 else f"   ({mb / 1024:.2f} GB)"
+        return label
 
-    def _clear() -> None:
-        listbox.selection_clear(0, "end")
+    def _update_queue_label() -> None:
+        n = len(queue)
+        rf.config(text=f"Fila de download ({n} iten{'s' if n != 1 else ''})")
 
-    def _confirm() -> None:
-        idxs = listbox.curselection()
-        if not idxs:
-            messagebox.showwarning(
-                "Nenhuma seleção",
-                "Selecione pelo menos um item ou clique em Cancelar.",
+    def _load(nc_path: str) -> None:
+        """Fetch and display the contents of *nc_path*."""
+        win.config(cursor="watch")
+        win.update()
+        try:
+            entries = scraper.list_directory(nc_path)
+        except Exception as exc:
+            messagebox.showerror(
+                "Erro ao listar pasta",
+                f"Não foi possível listar:\n{nc_path or '(raiz)'}\n\n{exc}",
                 parent=win,
             )
             return
-        result["values"] = [items[i][0] for i in idxs]
-        win.destroy()
+        finally:
+            win.config(cursor="")
+        state["path"] = nc_path
+        state["entries"] = entries
+        path_var.set(nc_path if nc_path else "/  (raiz do compartilhamento)")
+        btn_back.config(state="normal" if nav_stack else "disabled")
+        dir_lb.delete(0, "end")
+        for e in entries:
+            dir_lb.insert("end", _entry_label(e))
 
-    def _cancel() -> None:
-        result["values"] = None
-        win.destroy()
+    def _go_back() -> None:
+        if nav_stack:
+            _load(nav_stack.pop())
 
-    btn_bar = ttk.Frame(win)
-    btn_bar.pack(fill="x", padx=12, pady=(0, 12))
-    ttk.Button(btn_bar, text="Selecionar tudo", command=_select_all).pack(side="left")
-    ttk.Button(btn_bar, text="Limpar", command=_clear).pack(side="left", padx=6)
-    ttk.Button(btn_bar, text="Cancelar", command=_cancel).pack(side="right")
-    ttk.Button(btn_bar, text="Confirmar", command=_confirm).pack(side="right", padx=6)
+    def _enter_selected() -> None:
+        """Enter a folder on double-click/button. If a file is double-clicked, add it to queue."""
+        idxs = dir_lb.curselection()
+        if len(idxs) != 1:
+            messagebox.showwarning(
+                "Selecione uma pasta",
+                "Selecione exatamente uma pasta (📁) para entrar.",
+                parent=win,
+            )
+            return
+        e = state["entries"][idxs[0]]
+        if not e["is_dir"]:
+            # Double-click on a file → add it to the queue directly
+            _add_to_queue()
+            return
+        nav_stack.append(state["path"])
+        _load(e["path"])
 
-    win.protocol("WM_DELETE_WINDOW", _cancel)
+    def _add_to_queue() -> None:
+        idxs = dir_lb.curselection()
+        if not idxs:
+            messagebox.showwarning(
+                "Nenhum item selecionado",
+                "Selecione pelo menos um item antes de adicionar à fila.",
+                parent=win,
+            )
+            return
+        queue_paths = {item["path"] for item in queue}
+        added = 0
+        for i in idxs:
+            e = state["entries"][i]
+            if e["path"] not in queue_paths:
+                queue.append({
+                    "path": e["path"],
+                    "is_dir": e["is_dir"],
+                    "name": e["name"],
+                    "size_bytes": e.get("size_bytes"),
+                    "modified": e.get("modified"),
+                })
+                icon = "📁" if e["is_dir"] else "📄"
+                q_lb.insert("end", f"{icon}  {e['path']}")
+                added += 1
+        _update_queue_label()
+        if added == 0:
+            messagebox.showinfo(
+                "Já na fila",
+                "Os itens selecionados já estão na fila de download.",
+                parent=win,
+            )
+
+    def _remove() -> None:
+        idxs = q_lb.curselection()
+        for i in reversed(idxs):
+            queue.pop(i)
+            q_lb.delete(i)
+        _update_queue_label()
+
+    def _confirm() -> None:
+        if not queue:
+            messagebox.showwarning(
+                "Fila vazia",
+                "Adicione pelo menos um item à fila de download antes de confirmar.",
+                parent=win,
+            )
+            return
+        lines = ["Itens selecionados para download:\n"]
+        for item in queue:
+            icon = "📁" if item["is_dir"] else "📄"
+            lines.append(f"  {icon} {item['path']}")
+        lines.append(f"\n{len(queue)} item(ns) no total.\nDeseja iniciar o download?")
+        if messagebox.askyesno("Confirmar download", "\n".join(lines), parent=win):
+            result["paths"] = list(queue)
+            win.destroy()
+
+    btn_back.config(command=_go_back)
+    btn_enter.config(command=_enter_selected)
+    btn_add.config(command=_add_to_queue)
+    dir_lb.bind("<Double-Button-1>", lambda _: _enter_selected())
+    win.protocol("WM_DELETE_WINDOW", lambda: win.destroy())
+
+    _load("")       # start at the share root
     win.mainloop()
-    return result["values"] or []
-
-
-def _format_listing_label(item: dict) -> str:
-    """Build a friendly label for a directory listing entry."""
-    name = item["name"]
-    parts = [name]
-    if item.get("modified"):
-        parts.append(f"  [{item['modified']}]")
-    if item.get("size_bytes"):
-        size_mb = item["size_bytes"] / 1e6
-        if size_mb >= 1024:
-            parts.append(f"  ({size_mb / 1024:.1f} GB)")
-        else:
-            parts.append(f"  ({size_mb:.1f} MB)")
-    return "".join(parts)
-
-
-def _interactive_selection(session: NetworkSession, portal: str) -> dict[str, list[str] | None]:
-    """Show interactive dialogs for the user to pick datasets and subfolders.
-
-    Returns a selection dict: { dataset: [subfolder1, ...] | None }
-    where None means "download the whole dataset".
-    Exits the program if the user cancels.
-    """
-    if portal == "apache":
-        scraper: DirectoryScraper | NextcloudScraper = DirectoryScraper(session)
-        root_listing_url = APACHE_BASE_URL + "/"
-        def sub_listing_url(ds: str) -> str:
-            return f"{APACHE_BASE_URL}/{ds}/"
-    else:
-        scraper = NextcloudScraper(session)
-        root_listing_url = NC_SHARE_ROOT
-        def sub_listing_url(ds: str) -> str:
-            return f"{NC_SHARE_ROOT}/{ds}"
-
-    print("Listando datasets disponíveis no portal ...")
-    try:
-        top_entries = scraper.list_directory(root_listing_url)
-    except RFBConnectionError as exc:
-        _show_error(
-            "RFB Crawler — Erro",
-            f"Não foi possível listar os datasets do portal:\n\n{exc}",
-        )
-        sys.exit(2)
-
-    available_datasets = [e for e in top_entries if e["is_dir"]]
-    if not available_datasets:
-        _show_error(
-            "RFB Crawler — Erro",
-            "Nenhum dataset encontrado no portal. A estrutura pode ter mudado.",
-        )
-        sys.exit(2)
-
-    items = [
-        (e["name"], _format_listing_label(e)) for e in available_datasets
-    ]
-    chosen = _pick_from_list(
-        title="RFB Crawler — Selecione os datasets",
-        prompt=(
-            "Selecione os DATASETS que deseja baixar.\n"
-            "Em seguida, você poderá refinar quais subpastas (competências) "
-            "de cada dataset baixar."
-        ),
-        items=items,
-    )
-    if not chosen:
-        print("Nenhum dataset selecionado. Encerrando.")
-        sys.exit(0)
-
-    selection: dict[str, list[str] | None] = {}
-    for dataset in chosen:
-        print(f"Listando subpastas de {dataset} ...")
-        try:
-            sub_entries = scraper.list_directory(sub_listing_url(dataset))
-        except RFBConnectionError as exc:
-            logger.warning("Não foi possível listar %s: %s — baixando completo.",
-                           dataset, exc)
-            selection[dataset] = None
-            continue
-
-        sub_dirs = [e for e in sub_entries if e["is_dir"]]
-        if not sub_dirs:
-            # Dataset has only files, no subfolders — download all
-            selection[dataset] = None
-            continue
-
-        sub_items = [(e["name"], _format_listing_label(e)) for e in sub_dirs]
-        sub_chosen = _pick_from_list(
-            title=f"RFB Crawler — Subpastas de {dataset}",
-            prompt=(
-                f"Selecione as subpastas de {dataset} que deseja baixar.\n"
-                "Cancele esta janela para baixar TODAS as subpastas deste dataset."
-            ),
-            items=sub_items,
-        )
-        selection[dataset] = sub_chosen if sub_chosen else None
-
-    # Confirmation summary
-    from tkinter import messagebox
-    summary_lines = ["Resumo da seleção:\n"]
-    for ds, subs in selection.items():
-        if subs:
-            summary_lines.append(f"  • {ds}: {', '.join(subs)}")
-        else:
-            summary_lines.append(f"  • {ds}: (TODAS as subpastas)")
-    summary_lines.append("\nDeseja continuar e iniciar o download?")
-
-    root = _gui_root()
-    proceed = messagebox.askyesno(
-        "RFB Crawler — Confirmar download",
-        "\n".join(summary_lines),
-        parent=root,
-    )
-    root.destroy()
-    if not proceed:
-        print("Operação cancelada pelo usuário.")
-        sys.exit(0)
-
-    return selection
+    return result["paths"] or []
 
 
 if __name__ == "__main__":
+    print("Solução desenvolvida por Francisco Costa Carneiro")
     save_dir = _ask_save_directory()
     print(f"Pasta de destino: {save_dir}")
-    portal = _ask_portal()
-    print(f"Portal selecionado: {portal}")
-    _ensure_connectivity(portal)
+    _ensure_connectivity()
 
     try:
         with NetworkSession() as _sel_session:
-            user_selection = _interactive_selection(_sel_session, portal)
-
-        run(selection=user_selection, download_dir=save_dir, portal=portal)
+            selected_paths = _browse_nextcloud(_sel_session)
+            if not selected_paths:
+                print("Nenhum item selecionado. Encerrando.")
+                sys.exit(0)
+            run(nc_paths=selected_paths, download_dir=save_dir)
     except SystemExit:
         raise
     except Exception as exc:

@@ -66,14 +66,23 @@ def _download_file(
 
     local_path = governance.resolve_local_path(entry)
 
-    # Skip if file already on disk with same name (quick pre-check)
+    # Fast incremental check: compare WebDAV metadata (size + modified) against
+    # the manifest — no local hashing needed when the remote file is unchanged.
+    if governance.is_unchanged(entry):
+        stored = governance._url_index[entry.url]
+        log_row["status"] = "skipped"
+        log_row["file_hash"] = stored.get("file_hash", "")
+        logger.debug("Skipped (unchanged): %s", entry.name)
+        return log_row
+
+    # Fallback: if the file exists locally but metadata is missing/mismatched,
+    # hash the local copy before re-downloading.
     if local_path.exists():
-        # Compute hash of existing file to compare with manifest
         existing_hash = _sha256_file(local_path)
         if governance.is_known(existing_hash):
             log_row["status"] = "skipped"
             log_row["file_hash"] = existing_hash
-            logger.debug("Skipped (already known): %s", entry.name)
+            logger.debug("Skipped (hash match): %s", entry.name)
             return log_row
 
     try:

@@ -46,6 +46,8 @@ class DataGovernance:
         self._manifest_path = self.root / _MANIFEST_FILE
         self._catalog_path = self.root / _CATALOG_FILE
         self._manifest: dict[str, dict[str, Any]] = self._load_manifest()
+        # Secondary index: source_url → manifest record (for fast incremental checks)
+        self._url_index: dict[str, dict[str, Any]] = self._build_url_index()
 
     # ------------------------------------------------------------------
     # Manifest helpers
@@ -65,9 +67,35 @@ class DataGovernance:
             encoding="utf-8",
         )
 
+    def _build_url_index(self) -> dict[str, dict[str, Any]]:
+        """Build a secondary index: source_url → manifest record."""
+        return {
+            rec["source_url"]: rec
+            for rec in self._manifest.values()
+            if "source_url" in rec
+        }
+
     def is_known(self, file_hash: str) -> bool:
         """Return True if a file with this SHA-256 hash was already downloaded."""
         return file_hash in self._manifest
+
+    def is_unchanged(self, entry: "DirectoryEntry") -> bool:
+        """Return True when the remote file metadata matches the manifest record.
+
+        Uses WebDAV size + last-modified as a lightweight fingerprint to avoid
+        re-downloading and re-hashing files that haven't changed on the server.
+        Requires the local file to still exist on disk.
+        """
+        rec = self._url_index.get(entry.url)
+        if rec is None:
+            return False
+        # Both metadata fields must be present and match
+        if entry.size_bytes is None or rec.get("remote_size_bytes") != entry.size_bytes:
+            return False
+        if entry.modified is None or rec.get("remote_modified") != entry.modified:
+            return False
+        local_path = self.root / rec["local_path"]
+        return local_path.exists()
 
     def register_file(
         self,
@@ -77,16 +105,20 @@ class DataGovernance:
         bytes_written: int,
     ) -> None:
         """Record a successfully downloaded file in the manifest."""
-        self._manifest[file_hash] = {
+        record: dict[str, Any] = {
             "name": entry.name,
             "source_url": entry.url,
             "parent_folder": entry.parent_folder,
             "hierarchy": entry.hierarchy,
             "local_path": str(local_path.relative_to(self.root)),
             "size_bytes": bytes_written,
+            "remote_size_bytes": entry.size_bytes,
+            "remote_modified": entry.modified,
             "file_hash": file_hash,
             "download_timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        self._manifest[file_hash] = record
+        self._url_index[entry.url] = record
 
     # ------------------------------------------------------------------
     # Catalog
